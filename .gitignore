@@ -1,0 +1,25 @@
+# Python cache
+__pycache__/
+*.pyc
+
+# Virtual envs
+venv/
+.env/
+
+# Colab checkpoints
+.ipynb_checkpoints/
+
+# Large datasets
+data/
+*.csv
+*.npz
+*.npy
+
+# Model outputs
+outputs/logs/
+outputs/checkpoints/
+outputs/figures/
+
+# OS files
+.DS_Store
+Thumbs.db
