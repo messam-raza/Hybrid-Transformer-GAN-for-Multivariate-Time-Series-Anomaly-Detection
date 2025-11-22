@@ -1,72 +1,57 @@
+from __future__ import annotations
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
-mse_loss_fn = nn.MSELoss()
+mse = nn.MSELoss(reduction="mean")
+bce_logits = nn.BCEWithLogitsLoss(reduction="mean")
 
 
-def reconstruction_loss(recon: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    """
-    Mean squared error between reconstruction and target.
-    """
-    return mse_loss_fn(recon, target)
-
-
-def gan_discriminator_loss(
-    d_real_logits: torch.Tensor,
-    d_fake_logits: torch.Tensor,
-) -> torch.Tensor:
-    """
-    Non-saturating GAN discriminator loss with BCE logits.
-    """
-    real_labels = torch.ones_like(d_real_logits)
-    fake_labels = torch.zeros_like(d_fake_logits)
-
-    loss_real = F.binary_cross_entropy_with_logits(d_real_logits, real_labels)
-    loss_fake = F.binary_cross_entropy_with_logits(d_fake_logits, fake_labels)
-
-    return loss_real + loss_fake
-
-
-def gan_generator_loss(
-    d_fake_logits: torch.Tensor,
-) -> torch.Tensor:
-    """
-    Generator loss: fool the discriminator (labels = 1).
-    """
-    real_labels = torch.ones_like(d_fake_logits)
-    return F.binary_cross_entropy_with_logits(d_fake_logits, real_labels)
+def reconstruction_loss(x: torch.Tensor, x_recon: torch.Tensor) -> torch.Tensor:
+    return mse(x_recon, x)
 
 
 def info_nce_loss(
-    z1: torch.Tensor,
-    z2: torch.Tensor,
+    z_i: torch.Tensor,
+    z_j: torch.Tensor,
     temperature: float = 0.2,
 ) -> torch.Tensor:
     """
-    Symmetric InfoNCE loss for contrastive learning between two views.
-
-    z1, z2 : (B, D)
+    InfoNCE loss for a batch of positive pairs (z_i, z_j).
     """
-    z1 = F.normalize(z1, dim=-1)
-    z2 = F.normalize(z2, dim=-1)
+    z_i = F.normalize(z_i, dim=-1)
+    z_j = F.normalize(z_j, dim=-1)
 
-    batch_size = z1.size(0)
-    representations = torch.cat([z1, z2], dim=0)  # (2B, D)
+    logits = (z_i @ z_j.t()) / temperature
+    labels = torch.arange(z_i.size(0), device=z_i.device)
 
-    similarity_matrix = representations @ representations.t()  # (2B, 2B)
-    similarity_matrix = similarity_matrix / temperature
+    loss_i = F.cross_entropy(logits, labels)
+    loss_j = F.cross_entropy(logits.t(), labels)
+    return 0.5 * (loss_i + loss_j)
 
-    # Mask self-similarity
-    mask = torch.eye(2 * batch_size, dtype=torch.bool, device=z1.device)
-    similarity_matrix = similarity_matrix.masked_fill(mask, float("-inf"))
 
-    # Positive index for each row:
-    # for i in [0..B-1], positive is i+B
-    # for i in [B..2B-1], positive is i-B
-    labels = torch.arange(batch_size, device=z1.device)
-    labels = torch.cat([labels + batch_size, labels], dim=0)
+def gan_losses(
+    discriminator: nn.Module,
+    z_real: torch.Tensor,
+    z_fake: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Returns: (d_loss, g_loss)
+    """
+    logits_real = discriminator(z_real.detach())
+    logits_fake = discriminator(z_fake.detach())
 
-    loss = F.cross_entropy(similarity_matrix, labels)
-    return loss
+    real_labels = torch.ones_like(logits_real)
+    fake_labels = torch.zeros_like(logits_fake)
+
+    d_loss_real = bce_logits(logits_real, real_labels)
+    d_loss_fake = bce_logits(logits_fake, fake_labels)
+    d_loss = 0.5 * (d_loss_real + d_loss_fake)
+
+    # Generator wants fake to be classified as real
+    logits_fake_for_g = discriminator(z_fake)
+    g_loss = bce_logits(logits_fake_for_g, real_labels)
+
+    return d_loss, g_loss

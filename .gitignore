@@ -5,19 +5,15 @@ __pycache__/
 # Virtual envs
 venv/
 .env/
+.venv/
 
-# Colab checkpoints
+# Jupyter / Colab
 .ipynb_checkpoints/
 
-# Large datasets
+# Large data and outputs
 data/
-*.csv
-*.npz
-*.npy
-
-# Model outputs
-outputs/logs/
 outputs/checkpoints/
+outputs/logs/
 outputs/figures/
 
 # OS files

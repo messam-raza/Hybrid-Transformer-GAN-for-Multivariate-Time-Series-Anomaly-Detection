@@ -1,202 +1,295 @@
-import os
-from typing import Tuple
+from __future__ import annotations
+
+import argparse
 
 import torch
-from torch.utils.data import DataLoader
-from torch.optim import Adam
+from torch.utils.data import DataLoader, random_split
+from tqdm import tqdm
 
-from src.config import SMDConfig, ModelConfig, TrainConfig
-from src.data.preprocessing import compute_smd_normalization_stats
-from src.data.smd_dataset import SMDSequenceDataset
-from src.data.masking import apply_geometric_mask
-from src.models.hybrid_model import HybridAnomalyModel
-from src.training.losses import (
-    reconstruction_loss,
-    gan_discriminator_loss,
-    gan_generator_loss,
-    info_nce_loss,
-)
+from src.config import ExperimentConfig
+from src.data.smd_dataset import load_smd_machine, SlidingWindowDataset
+from src.data.preprocessing import compute_zscore_params, apply_zscore
+from src.data.masking import geometric_mask
+from src.models.transformer import TimeSeriesTransformerAE
+from src.models.gan import LatentGenerator, LatentDiscriminator
+from src.training.losses import reconstruction_loss, info_nce_loss, gan_losses
 from src.utils.seed import set_seed
-from src.utils.metrics import compute_roc_auc
-from src.utils.plot import save_reconstruction_plot
 
 
-def get_device() -> torch.device:
-    return torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Train Hybrid Transformer-GAN TSAD on SMD."
+    )
+    parser.add_argument(
+        "--machine_id", type=str, default="machine-1-1", help="SMD machine id"
+    )
+    parser.add_argument(
+        "--epochs", type=int, default=None, help="Override number of epochs."
+    )
+    parser.add_argument(
+        "--batch_size", type=int, default=None, help="Override batch size."
+    )
+    return parser.parse_args()
 
 
-def create_dataloaders(
-    smd_config: SMDConfig,
-    batch_size: int,
-) -> Tuple[DataLoader, DataLoader, torch.Tensor, torch.Tensor]:
-    mean, std = compute_smd_normalization_stats(smd_config.root_dir, smd_config.machines)
-
-    train_dataset = SMDSequenceDataset(smd_config, split="train", mean=mean, std=std)
-    test_dataset = SMDSequenceDataset(smd_config, split="test", mean=mean, std=std)
-
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, drop_last=False)
-
-    mean_t = torch.from_numpy(mean)
-    std_t = torch.from_numpy(std)
-
-    return train_loader, test_loader, mean_t, std_t
-
-
-def train_one_epoch(
-    model: HybridAnomalyModel,
-    train_loader: DataLoader,
-    optimizer_g: Adam,
-    optimizer_d: Adam,
-    device: torch.device,
-    train_cfg: TrainConfig,
-    epoch: int,
-) -> float:
-    model.train()
-    total_loss = 0.0
-    total_batches = 0
-
-    for batch in train_loader:
-        x = batch["input"].to(device)  # (B, T, D)
-        B, T, D = x.shape
-
-        z_noise = torch.randn(B, model.latent_dim, device=device)
-
-        # ----- Discriminator update -----
-        optimizer_d.zero_grad()
-        with torch.no_grad():
-            _, _, d_real_logits, d_fake_logits = model(x, z_noise)
-        d_loss = gan_discriminator_loss(d_real_logits, d_fake_logits)
-        d_loss.backward()
-        optimizer_d.step()
-
-        # ----- Generator + Transformer + Contrastive update -----
-        optimizer_g.zero_grad()
-
-        recon, z, d_real_logits, d_fake_logits = model(x, z_noise)
-
-        # Reconstruction loss
-        recon_loss = reconstruction_loss(recon, x)
-
-        # Contrastive loss using two masked views
-        x_masked1, _ = apply_geometric_mask(x, mask_type="random_rectangle", mask_ratio=0.15)
-        x_masked2, _ = apply_geometric_mask(x, mask_type="random_rectangle", mask_ratio=0.15)
-
-        _, z1 = model.transformer(x_masked1)
-        _, z2 = model.transformer(x_masked2)
-
-        contrastive = info_nce_loss(z1, z2, temperature=0.2)
-
-        # Generator loss (GAN)
-        g_loss = gan_generator_loss(d_fake_logits)
-
-        loss = (
-            train_cfg.recon_loss_weight * recon_loss
-            + train_cfg.contrastive_loss_weight * contrastive
-            + train_cfg.gan_loss_weight * g_loss
-        )
-
-        loss.backward()
-        optimizer_g.step()
-
-        total_loss += loss.item()
-        total_batches += 1
-
-    avg_loss = total_loss / max(1, total_batches)
-    print(f"Epoch {epoch}: train loss = {avg_loss:.4f}")
-    return avg_loss
-
-
-@torch.no_grad()
-def evaluate(
-    model: HybridAnomalyModel,
-    test_loader: DataLoader,
-    device: torch.device,
-) -> float:
-    model.eval()
-    all_scores = []
-    all_labels = []
-
-    for i, batch in enumerate(test_loader):
-        x = batch["input"].to(device)
-        y = batch["label"].to(device)
-
-        recon, z = model.transformer(x)
-        recon_error = torch.mean((recon - x) ** 2, dim=(1, 2))  # per-window score
-
-        all_scores.append(recon_error.cpu())
-        all_labels.append(y.cpu())
-
-        if i == 0:
-            save_reconstruction_plot(x.cpu(), recon.cpu())
-
-    scores = torch.cat(all_scores).numpy()
-    labels = torch.cat(all_labels).numpy()
-
-    auc = compute_roc_auc(labels, scores)
-    print(f"Test ROC-AUC: {auc:.4f}")
-    return auc
-
-
-def main() -> None:
+def main():
+    args = parse_args()
     set_seed(42)
 
-    device = get_device()
+    cfg = ExperimentConfig(machine_id=args.machine_id)
+    if args.epochs is not None:
+        cfg.num_epochs = args.epochs
+    if args.batch_size is not None:
+        cfg.batch_size = args.batch_size
+    cfg.experiment_name = f"smd_{cfg.machine_id}"
+
+    device = torch.device(cfg.device)
+    exp_dir = cfg.experiment_dir()
     print(f"Using device: {device}")
+    print(f"Experiment dir: {exp_dir}")
 
-    smd_cfg = SMDConfig()
-    model_cfg = ModelConfig()
-    train_cfg = TrainConfig()
-    train_cfg.device = str(device)
+    # 1. Load raw data
+    train_raw, test_raw, test_labels = load_smd_machine(
+        root_dir=cfg.dataset_root, machine_id=cfg.machine_id
+    )
+    print(f"Train shape: {train_raw.shape}, Test shape: {test_raw.shape}")
 
-    train_loader, test_loader, mean_t, std_t = create_dataloaders(smd_cfg, train_cfg.batch_size)
+    # 2. Normalize
+    if cfg.normalize:
+        mean, std = compute_zscore_params(train_raw)
+        train_data = apply_zscore(train_raw, mean, std)
+        test_data = apply_zscore(test_raw, mean, std)
+    else:
+        train_data = train_raw
+        test_data = test_raw
 
-    model = HybridAnomalyModel(
-        input_dim=model_cfg.input_dim,
-        window_size=smd_cfg.window_size,
-        d_model=model_cfg.d_model,
-        n_heads=model_cfg.n_heads,
-        num_layers=model_cfg.num_layers,
-        dim_feedforward=model_cfg.dim_feedforward,
-        dropout=model_cfg.dropout,
-        latent_dim=model_cfg.latent_dim,
+    # 3. Datasets
+    full_train_ds = SlidingWindowDataset(
+        series=train_data,
+        labels=None,
+        window_size=cfg.window_size,
+        stride=cfg.window_stride,
+    )
+    n_train = int(len(full_train_ds) * cfg.train_val_split)
+    n_val = len(full_train_ds) - n_train
+    train_ds, val_ds = random_split(
+        full_train_ds,
+        [n_train, n_val],
+        generator=torch.Generator().manual_seed(42),
+    )
+
+    test_ds = SlidingWindowDataset(
+        series=test_data,
+        labels=test_labels,
+        window_size=cfg.window_size,
+        stride=cfg.window_stride,
+    )
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=cfg.batch_size,
+        shuffle=True,
+        drop_last=True,
+        num_workers=cfg.num_workers,
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=cfg.batch_size,
+        shuffle=False,
+        num_workers=cfg.num_workers,
+    )
+    test_loader = DataLoader(
+        test_ds,
+        batch_size=cfg.batch_size,
+        shuffle=False,
+        num_workers=cfg.num_workers,
+    )
+
+    # 4. Models
+    encoder = TimeSeriesTransformerAE(
+        input_dim=cfg.input_dim,
+        d_model=cfg.d_model,
+        n_heads=cfg.n_heads,
+        num_layers=cfg.num_layers,
+        dim_feedforward=cfg.dim_feedforward,
+        dropout=cfg.dropout,
     ).to(device)
 
-    optimizer_g = Adam(
-        list(model.transformer.parameters()) + list(model.generator.parameters()),
-        lr=train_cfg.lr,
+    generator = LatentGenerator(cfg.latent_dim).to(device)
+    discriminator = LatentDiscriminator(cfg.latent_dim).to(device)
+
+    # 5. Optimizers
+    opt_main = torch.optim.AdamW(
+        list(encoder.parameters()) + list(generator.parameters()),
+        lr=cfg.lr_main,
+        weight_decay=cfg.weight_decay,
     )
-    optimizer_d = Adam(model.discriminator.parameters(), lr=train_cfg.lr)
+    opt_d = torch.optim.AdamW(
+        discriminator.parameters(),
+        lr=cfg.lr_discriminator,
+        weight_decay=cfg.weight_decay,
+    )
 
-    best_auc = 0.0
-    os.makedirs("outputs/checkpoints", exist_ok=True)
+    best_val_loss = None
 
-    for epoch in range(1, train_cfg.num_epochs + 1):
-        train_one_epoch(
-            model,
+    # 6. Training loop
+    for epoch in range(1, cfg.num_epochs + 1):
+        train_loss = run_epoch(
+            encoder,
+            generator,
+            discriminator,
             train_loader,
-            optimizer_g,
-            optimizer_d,
+            opt_main,
+            opt_d,
+            cfg,
             device,
-            train_cfg,
             epoch,
+            is_train=True,
         )
-        auc = evaluate(model, test_loader, device)
+        val_loss = run_epoch(
+            encoder,
+            generator,
+            discriminator,
+            val_loader,
+            opt_main,
+            opt_d,
+            cfg,
+            device,
+            epoch,
+            is_train=False,
+        )
 
-        if auc > best_auc:
-            best_auc = auc
-            ckpt_path = os.path.join("outputs", "checkpoints", "best_model.pt")
+        print(
+            f"[Epoch {epoch:03d}] train_loss={train_loss:.4f} "
+            f"| val_loss={val_loss:.4f}"
+        )
+
+        # Save best
+        if best_val_loss is None or val_loss < best_val_loss:
+            best_val_loss = val_loss
+            ckpt_path = exp_dir / "best.pt"
             torch.save(
                 {
-                    "model_state": model.state_dict(),
-                    "auc": best_auc,
                     "epoch": epoch,
+                    "config": cfg.__dict__,
+                    "encoder": encoder.state_dict(),
+                    "generator": generator.state_dict(),
+                    "discriminator": discriminator.state_dict(),
                 },
                 ckpt_path,
             )
-            print(f"Saved new best model to {ckpt_path}")
+            print(f"Saved best checkpoint to {ckpt_path}")
 
-    print(f"Training complete. Best ROC-AUC: {best_auc:.4f}")
+    # Optionally: quick test loop just to check it runs
+    print("Computing reconstruction errors on test set (for sanity)...")
+    encoder.eval()
+    with torch.no_grad():
+        for x, _ in test_loader:
+            x = x.to(device)
+            x_recon, _ = encoder(x)
+            _ = (x_recon - x).pow(2).mean().item()
+            break
+
+    print("Training finished.")
+
+
+def run_epoch(
+    encoder,
+    generator,
+    discriminator,
+    dataloader,
+    opt_main,
+    opt_d,
+    cfg: ExperimentConfig,
+    device,
+    epoch: int,
+    is_train: bool,
+):
+    if is_train:
+        encoder.train()
+        generator.train()
+        discriminator.train()
+    else:
+        encoder.eval()
+        generator.eval()
+        discriminator.eval()
+
+    total_loss = 0.0
+    count = 0
+
+    loop = tqdm(dataloader, desc=f"Epoch {epoch} [{'train' if is_train else 'val'}]")
+
+    for x, _ in loop:
+        x = x.to(device)  # (B, T, D)
+        batch_size = x.size(0)
+
+        x_aug = geometric_mask(x)
+
+        # Forward encoder
+        x_recon, z_orig = encoder(x)
+        x_recon_aug, z_aug = encoder(x_aug)
+
+        if is_train:
+            # --- Update discriminator ---
+            opt_d.zero_grad(set_to_none=True)
+
+            z_fake_for_d = generator(z_aug)
+            d_loss, _ = gan_losses(discriminator, z_real=z_orig, z_fake=z_fake_for_d)
+            d_loss.backward()
+            opt_d.step()
+
+            # --- Update encoder + generator ---
+            opt_main.zero_grad(set_to_none=True)
+            z_fake = generator(z_aug)
+
+            recon_loss_orig = reconstruction_loss(x, x_recon)
+            recon_loss_aug = reconstruction_loss(x, x_recon_aug)
+            recon_total = 0.5 * (recon_loss_orig + recon_loss_aug)
+
+            cont_loss = info_nce_loss(
+                z_orig, z_aug, temperature=cfg.contrastive_temperature
+            )
+
+            _, g_loss = gan_losses(discriminator, z_real=z_orig, z_fake=z_fake)
+
+            loss = (
+                cfg.lambda_recon * recon_total
+                + cfg.lambda_contrastive * cont_loss
+                + cfg.lambda_gan * g_loss
+            )
+
+            loss.backward()
+            opt_main.step()
+
+        else:
+            with torch.no_grad():
+                z_fake = generator(z_aug)
+                recon_loss_orig = reconstruction_loss(x, x_recon)
+                recon_loss_aug = reconstruction_loss(x, x_recon_aug)
+                recon_total = 0.5 * (recon_loss_orig + recon_loss_aug)
+                cont_loss = info_nce_loss(
+                    z_orig, z_aug, temperature=cfg.contrastive_temperature
+                )
+                _, g_loss = gan_losses(discriminator, z_real=z_orig, z_fake=z_fake)
+                loss = (
+                    cfg.lambda_recon * recon_total
+                    + cfg.lambda_contrastive * cont_loss
+                    + cfg.lambda_gan * g_loss
+                )
+
+        total_loss += loss.item()
+        count += 1
+
+        loop.set_postfix(
+            {
+                "loss": f"{loss.item():.4f}",
+                "recon": f"{recon_total.item():.4f}",
+                "cont": f"{cont_loss.item():.4f}",
+                "B": batch_size,
+            }
+        )
+
+    return total_loss / max(count, 1)
 
 
 if __name__ == "__main__":

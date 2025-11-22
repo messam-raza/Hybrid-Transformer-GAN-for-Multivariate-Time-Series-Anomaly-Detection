@@ -1,91 +1,105 @@
-import os
-from typing import Tuple
+from __future__ import annotations
 
+import argparse
+from pathlib import Path
+
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from src.config import SMDConfig, ModelConfig, TrainConfig
-from src.data.preprocessing import compute_smd_normalization_stats
-from src.data.smd_dataset import SMDSequenceDataset
-from src.models.hybrid_model import HybridAnomalyModel
-from src.utils.metrics import compute_roc_auc
-from src.utils.plot import save_reconstruction_plot
+from src.config import ExperimentConfig
+from src.data.smd_dataset import load_smd_machine, SlidingWindowDataset
+from src.data.preprocessing import compute_zscore_params, apply_zscore
+from src.models.transformer import TimeSeriesTransformerAE
+from src.utils.metrics import evaluate_window_metrics
 from src.utils.seed import set_seed
 
 
-def load_dataloader(
-    smd_cfg: SMDConfig,
-    batch_size: int,
-) -> Tuple[DataLoader, torch.Tensor, torch.Tensor]:
-    mean, std = compute_smd_normalization_stats(smd_cfg.root_dir, smd_cfg.machines)
-    test_dataset = SMDSequenceDataset(smd_cfg, split="test", mean=mean, std=std)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, drop_last=False)
-    mean_t = torch.from_numpy(mean)
-    std_t = torch.from_numpy(std)
-    return test_loader, mean_t, std_t
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Evaluate Hybrid Transformer-GAN TSAD on SMD."
+    )
+    parser.add_argument(
+        "--machine_id", type=str, default="machine-1-1", help="SMD machine id"
+    )
+    return parser.parse_args()
 
 
-@torch.no_grad()
-def evaluate_checkpoint(
-    ckpt_path: str,
-) -> None:
+def main():
+    args = parse_args()
     set_seed(42)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    cfg = ExperimentConfig(machine_id=args.machine_id)
+    cfg.experiment_name = f"smd_{cfg.machine_id}"
+    device = torch.device(cfg.device)
 
-    smd_cfg = SMDConfig()
-    model_cfg = ModelConfig()
-    train_cfg = TrainConfig()
-    train_cfg.device = str(device)
-
-    test_loader, mean_t, std_t = load_dataloader(smd_cfg, train_cfg.batch_size)
-
-    model = HybridAnomalyModel(
-        input_dim=model_cfg.input_dim,
-        window_size=smd_cfg.window_size,
-        d_model=model_cfg.d_model,
-        n_heads=model_cfg.n_heads,
-        num_layers=model_cfg.num_layers,
-        dim_feedforward=model_cfg.dim_feedforward,
-        dropout=model_cfg.dropout,
-        latent_dim=model_cfg.latent_dim,
-    ).to(device)
-
-    if not os.path.isfile(ckpt_path):
+    exp_dir = cfg.experiment_dir()
+    ckpt_path = exp_dir / "best.pt"
+    if not ckpt_path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
 
+    print(f"Loading checkpoint from {ckpt_path}")
     ckpt = torch.load(ckpt_path, map_location=device)
-    model.load_state_dict(ckpt["model_state"])
-    model.eval()
 
-    all_scores = []
-    all_labels = []
+    # Load data
+    train_raw, test_raw, test_labels = load_smd_machine(
+        root_dir=cfg.dataset_root, machine_id=cfg.machine_id
+    )
+    if cfg.normalize:
+        mean, std = compute_zscore_params(train_raw)
+        test_data = apply_zscore(test_raw, mean, std)
+    else:
+        test_data = test_raw
 
-    for i, batch in enumerate(test_loader):
-        x = batch["input"].to(device)
-        y = batch["label"].to(device)
+    test_ds = SlidingWindowDataset(
+        series=test_data,
+        labels=test_labels,
+        window_size=cfg.window_size,
+        stride=cfg.window_stride,
+    )
+    test_loader = DataLoader(
+        test_ds,
+        batch_size=cfg.batch_size,
+        shuffle=False,
+        num_workers=cfg.num_workers,
+    )
 
-        recon, z = model.transformer(x)
-        recon_error = torch.mean((recon - x) ** 2, dim=(1, 2))
+    # Rebuild encoder (only need this for recon errors)
+    encoder = TimeSeriesTransformerAE(
+        input_dim=cfg.input_dim,
+        d_model=cfg.d_model,
+        n_heads=cfg.n_heads,
+        num_layers=cfg.num_layers,
+        dim_feedforward=cfg.dim_feedforward,
+        dropout=cfg.dropout,
+    ).to(device)
 
-        all_scores.append(recon_error.cpu())
-        all_labels.append(y.cpu())
+    encoder.load_state_dict(ckpt["encoder"])
+    encoder.eval()
 
-        if i == 0:
-            save_reconstruction_plot(
-                x.cpu(),
-                recon.cpu(),
-                save_path=os.path.join("outputs", "figures", "reconstruction_example.png"),
-            )
+    # Compute window-wise reconstruction errors and labels
+    scores = []
+    labels = []
 
-    scores = torch.cat(all_scores).numpy()
-    labels = torch.cat(all_labels).numpy()
+    with torch.no_grad():
+        for x, y in test_loader:
+            x = x.to(device)
+            x_recon, _ = encoder(x)
+            mse = (x_recon - x).pow(2).mean(dim=(1, 2))  # (B,)
 
-    auc = compute_roc_auc(labels, scores)
-    print(f"Checkpoint ROC-AUC: {auc:.4f}")
+            scores.append(mse.cpu().numpy())
+            if y is not None:
+                window_labels = (y.max(dim=1).values > 0).long().cpu().numpy()
+                labels.append(window_labels)
+
+    scores = np.concatenate(scores, axis=0)
+    labels = np.concatenate(labels, axis=0)
+
+    metrics = evaluate_window_metrics(scores, labels)
+    print("Evaluation metrics (window-level):")
+    for k, v in metrics.items():
+        print(f"  {k}: {v:.4f}")
 
 
 if __name__ == "__main__":
-    ckpt_path = os.path.join("outputs", "checkpoints", "best_model.pt")
-    evaluate_checkpoint(ckpt_path)
+    main()

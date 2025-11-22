@@ -1,43 +1,63 @@
-import os
 from dataclasses import dataclass
+from pathlib import Path
 
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+import torch
 
-DATA_DIR = os.path.join(PROJECT_ROOT, "data")
-SMD_DIR = os.path.join(DATA_DIR, "ServerMachineDataset")
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DATA_DIR = PROJECT_ROOT / "data"
+SMD_DIR = DATA_DIR / "ServerMachineDataset"
+OUTPUT_DIR = PROJECT_ROOT / "outputs"
 
 
 @dataclass
-class SMDConfig:
-    # Root directory of SMD dataset
-    root_dir: str = SMD_DIR
-    # Sliding window parameters
+class ExperimentConfig:
+    # ---- Dataset ----
+    dataset_root: Path = SMD_DIR
+    machine_id: str = "machine-1-1"
     window_size: int = 100
-    step_size: int = 10
-    # Whether to apply z-score normalization
+    window_stride: int = 1
     normalize: bool = True
-    # If empty, use all machines. Otherwise, list machine names (file stems without .txt)
-    machines: tuple[str, ...] = ()
+    train_val_split: float = 0.9
 
-
-@dataclass
-class ModelConfig:
-    # SMD has 38 metrics per time step
+    # ---- Model (SMD: typically 38 metrics; verify your files) ----
     input_dim: int = 38
-    d_model: int = 64
+    d_model: int = 128
     n_heads: int = 4
-    num_layers: int = 2
-    dim_feedforward: int = 128
+    num_layers: int = 3
+    dim_feedforward: int = 256
     dropout: float = 0.1
-    latent_dim: int = 64  # for contrastive + GAN
+    latent_dim: int = 128  # same as d_model for simplicity
 
+    # ---- Training ----
+    batch_size: int = 64
+    num_epochs: int = 30
+    lr_main: float = 1e-4          # encoder + generator
+    lr_discriminator: float = 5e-5
+    weight_decay: float = 1e-5
+    num_workers: int = 2
 
-@dataclass
-class TrainConfig:
-    batch_size: int = 64         # shrink to 32 if memory is low
-    num_epochs: int = 20
-    lr: float = 1e-3
-    device: str = "cpu"          # will be set dynamically
-    recon_loss_weight: float = 1.0
-    contrastive_loss_weight: float = 0.5
-    gan_loss_weight: float = 0.5
+    # ---- Loss weights / temperature ----
+    lambda_recon: float = 1.0
+    lambda_contrastive: float = 0.5
+    lambda_gan: float = 0.1
+    contrastive_temperature: float = 0.2
+
+    # ---- Device & output ----
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    experiment_name: str = "smd_machine-1-1"
+
+    def experiment_dir(self) -> Path:
+        path = OUTPUT_DIR / "checkpoints" / self.experiment_name
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def figures_dir(self) -> Path:
+        path = OUTPUT_DIR / "figures"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def logs_dir(self) -> Path:
+        path = OUTPUT_DIR / "logs"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
