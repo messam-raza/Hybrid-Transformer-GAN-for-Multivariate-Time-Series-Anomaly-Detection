@@ -1,12 +1,12 @@
-from setuptools import setup
+from setuptools import setup, find_packages
 
 setup(
     name="hybrid_transformer_gan_tsad",
     version="1.0.0",
     author="Messam Raza",
     description="Hybrid Transformer–GAN Framework for Multivariate Time-Series Anomaly Detection",
-    packages=['src'],
-    package_dir={'src': 'src'},
+    packages=find_packages(where="."),
+    package_dir={"": "."},
     include_package_data=True,
     install_requires=[
         "torch>=2.0.0",
