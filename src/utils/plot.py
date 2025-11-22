@@ -1,44 +1,37 @@
-import os
-from typing import Optional
+from __future__ import annotations
 
-import numpy as np
 import matplotlib.pyplot as plt
-import torch
+import numpy as np
+from pathlib import Path
 
 
-def save_reconstruction_plot(
-    x: torch.Tensor,
-    recon: torch.Tensor,
-    num_series: int = 3,
-    save_path: Optional[str] = None,
-) -> None:
+def plot_reconstruction(
+    original: np.ndarray,
+    reconstructed: np.ndarray,
+    save_path: Path | None = None,
+    num_features: int = 3,
+):
     """
-    Save a simple reconstruction plot for a few feature dimensions
-    of the first sample in the batch.
+    Plot a few feature dimensions of original vs reconstructed.
     """
-    os.makedirs("outputs/figures", exist_ok=True)
-    if save_path is None:
-        save_path = os.path.join("outputs", "figures", "reconstruction.png")
+    T, D = original.shape
+    num_features = min(num_features, D)
+    t = np.arange(T)
 
-    x_np = x[0].numpy()      # (T, D)
-    recon_np = recon[0].numpy()
-
-    T, D = x_np.shape
-    num_series = min(num_series, D)
-
-    t_axis = np.arange(T)
-
-    plt.figure(figsize=(10, 6))
-
-    for i in range(num_series):
-        plt.subplot(num_series, 1, i + 1)
-        plt.plot(t_axis, x_np[:, i], label="Original")
-        plt.plot(t_axis, recon_np[:, i], label="Reconstruction", linestyle="--")
+    plt.figure(figsize=(12, 6))
+    for i in range(num_features):
+        plt.subplot(num_features, 1, i + 1)
+        plt.plot(t, original[:, i], label="Original")
+        plt.plot(t, reconstructed[:, i], linestyle="--", label="Reconstructed")
         if i == 0:
             plt.legend(loc="upper right")
-        plt.xlabel("Time step")
-        plt.ylabel(f"Feature {i}")
+        plt.ylabel(f"Feat {i}")
+    plt.xlabel("Time")
 
-    plt.tight_layout()
-    plt.savefig(save_path)
-    plt.close()
+    if save_path is not None:
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        plt.tight_layout()
+        plt.savefig(save_path)
+    else:
+        plt.tight_layout()
+        plt.show()

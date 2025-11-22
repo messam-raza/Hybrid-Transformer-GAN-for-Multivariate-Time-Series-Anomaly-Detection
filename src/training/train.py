@@ -180,8 +180,8 @@ def main():
             )
             print(f"Saved best checkpoint to {ckpt_path}")
 
-    # Optionally: quick test loop just to check it runs
-    print("Computing reconstruction errors on test set (for sanity)...")
+    # Sanity: one test batch
+    print("Computing reconstruction errors on test set (sanity check)...")
     encoder.eval()
     with torch.no_grad():
         for x, _ in test_loader:
@@ -284,7 +284,6 @@ def run_epoch(
             {
                 "loss": f"{loss.item():.4f}",
                 "recon": f"{recon_total.item():.4f}",
-                "cont": f"{cont_loss.item():.4f}",
                 "B": batch_size,
             }
         )

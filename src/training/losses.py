@@ -50,7 +50,6 @@ def gan_losses(
     d_loss_fake = bce_logits(logits_fake, fake_labels)
     d_loss = 0.5 * (d_loss_real + d_loss_fake)
 
-    # Generator wants fake to be classified as real
     logits_fake_for_g = discriminator(z_fake)
     g_loss = bce_logits(logits_fake_for_g, real_labels)
 

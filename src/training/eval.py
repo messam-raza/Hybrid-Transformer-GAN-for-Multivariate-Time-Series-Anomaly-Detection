@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
 
 import numpy as np
 import torch
@@ -64,7 +63,7 @@ def main():
         num_workers=cfg.num_workers,
     )
 
-    # Rebuild encoder (only need this for recon errors)
+    # Rebuild encoder
     encoder = TimeSeriesTransformerAE(
         input_dim=cfg.input_dim,
         d_model=cfg.d_model,
@@ -77,7 +76,6 @@ def main():
     encoder.load_state_dict(ckpt["encoder"])
     encoder.eval()
 
-    # Compute window-wise reconstruction errors and labels
     scores = []
     labels = []
 
@@ -88,9 +86,8 @@ def main():
             mse = (x_recon - x).pow(2).mean(dim=(1, 2))  # (B,)
 
             scores.append(mse.cpu().numpy())
-            if y is not None:
-                window_labels = (y.max(dim=1).values > 0).long().cpu().numpy()
-                labels.append(window_labels)
+            window_labels = (y.max(dim=1).values > 0).long().cpu().numpy()
+            labels.append(window_labels)
 
     scores = np.concatenate(scores, axis=0)
     labels = np.concatenate(labels, axis=0)

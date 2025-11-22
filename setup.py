@@ -3,7 +3,7 @@ from setuptools import setup, find_packages
 setup(
     name="hybrid_transformer_gan_tsad",
     version="1.0.0",
-    author="Farhan Ahmed",
+    author="Messam Raza",
     description="Hybrid Transformer–GAN Framework for Multivariate Time-Series Anomaly Detection",
     packages=find_packages(where="src"),
     package_dir={"": "src"},
@@ -16,6 +16,7 @@ setup(
         "matplotlib>=3.7.0",
         "tqdm>=4.66.0",
         "PyYAML>=6.0.0",
+        "seaborn>=0.13.0",
     ],
     python_requires=">=3.9",
 )

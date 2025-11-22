@@ -3,7 +3,6 @@ from pathlib import Path
 
 import torch
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = PROJECT_ROOT / "data"
 SMD_DIR = DATA_DIR / "ServerMachineDataset"
@@ -20,19 +19,19 @@ class ExperimentConfig:
     normalize: bool = True
     train_val_split: float = 0.9
 
-    # ---- Model (SMD: typically 38 metrics; verify your files) ----
-    input_dim: int = 38
+    # ---- Model ----
+    input_dim: int = 38           # SMD has 38 metrics
     d_model: int = 128
     n_heads: int = 4
     num_layers: int = 3
     dim_feedforward: int = 256
     dropout: float = 0.1
-    latent_dim: int = 128  # same as d_model for simplicity
+    latent_dim: int = 128
 
     # ---- Training ----
     batch_size: int = 64
-    num_epochs: int = 30
-    lr_main: float = 1e-4          # encoder + generator
+    num_epochs: int = 20
+    lr_main: float = 1e-4
     lr_discriminator: float = 5e-5
     weight_decay: float = 1e-5
     num_workers: int = 2
@@ -43,7 +42,7 @@ class ExperimentConfig:
     lambda_gan: float = 0.1
     contrastive_temperature: float = 0.2
 
-    # ---- Device & output ----
+    # ---- Device & naming ----
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     experiment_name: str = "smd_machine-1-1"
 

@@ -1,16 +1,18 @@
-# Python cache
+# Byte-compiled / cache
 __pycache__/
-*.pyc
+*.py[cod]
+*.pyo
 
-# Virtual envs
+# Virtual environments
 venv/
-.env/
 .venv/
+env/
+.env/
 
 # Jupyter / Colab
 .ipynb_checkpoints/
 
-# Large data and outputs
+# Data and outputs
 data/
 outputs/checkpoints/
 outputs/logs/

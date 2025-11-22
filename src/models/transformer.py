@@ -1,3 +1,6 @@
+from __future__ import annotations
+
+import math
 from typing import Tuple
 
 import torch
@@ -5,90 +8,84 @@ import torch.nn as nn
 
 
 class PositionalEncoding(nn.Module):
-    """
-    Standard sinusoidal positional encoding.
-    """
-
-    def __init__(self, d_model: int, max_len: int = 1000) -> None:
+    def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 10000):
         super().__init__()
-        pe = torch.zeros(max_len, d_model, dtype=torch.float32)
+        self.dropout = nn.Dropout(dropout)
+
+        pe = torch.zeros(max_len, d_model)
         position = torch.arange(0, max_len, dtype=torch.float32).unsqueeze(1)
         div_term = torch.exp(
             torch.arange(0, d_model, 2, dtype=torch.float32)
-            * (-torch.log(torch.tensor(10000.0)) / d_model)
+            * (-math.log(10000.0) / d_model)
         )
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0)  # (1, max_len, d_model)
+        pe = pe.unsqueeze(0)  # (1, T, d_model)
         self.register_buffer("pe", pe)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        x: (B, T, D)
+        x: (B, T, d_model)
         """
-        B, T, D = x.shape
-        return x + self.pe[:, :T, :D]
+        T = x.size(1)
+        x = x + self.pe[:, :T, :]
+        return self.dropout(x)
 
 
-class TimeSeriesTransformer(nn.Module):
+class TimeSeriesTransformerAE(nn.Module):
     """
-    Lightweight Transformer for multivariate time-series
-    reconstruction and representation.
+    Transformer-based autoencoder.
+
+    Input:  (B, T, D_in)
+    Output: reconstruction (B, T, D_in), latent (B, d_model)
     """
 
     def __init__(
         self,
         input_dim: int,
-        d_model: int = 64,
+        d_model: int = 128,
         n_heads: int = 4,
-        num_layers: int = 2,
-        dim_feedforward: int = 128,
+        num_layers: int = 3,
+        dim_feedforward: int = 256,
         dropout: float = 0.1,
-        latent_dim: int = 64,
     ) -> None:
         super().__init__()
 
-        self.input_dim = input_dim
-        self.d_model = d_model
-        self.latent_dim = latent_dim
+        self.input_projection = nn.Linear(input_dim, d_model)
+        self.positional_encoding = PositionalEncoding(d_model, dropout=dropout)
 
-        self.input_proj = nn.Linear(input_dim, d_model)
-        self.pos_encoding = PositionalEncoding(d_model)
-
-        encoder_layer = nn.TransformerEncoderLayer(
+        enc_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
             nhead=n_heads,
             dim_feedforward=dim_feedforward,
             dropout=dropout,
             batch_first=True,
+            activation="gelu",
         )
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
 
-        self.latent_proj = nn.Linear(d_model, latent_dim)
-
-        self.decoder = nn.Sequential(
-            nn.Linear(latent_dim, d_model),
-            nn.ReLU(),
-            nn.Linear(d_model, input_dim),
-        )
+        self.output_projection = nn.Linear(d_model, input_dim)
+        self.latent_norm = nn.LayerNorm(d_model)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        x : (B, T, D)
-
+        Args:
+            x: (B, T, D_in)
         Returns:
-        recon : (B, T, D)
-        z     : (B, latent_dim)  - mean-pooled latent
+            x_recon: (B, T, D_in)
+            z: (B, d_model)
         """
-        h = self.input_proj(x)        # (B, T, d_model)
-        h = self.pos_encoding(h)
-        h = self.encoder(h)           # (B, T, d_model)
+        h = self.input_projection(x)   # (B, T, d_model)
+        h = self.positional_encoding(h)
+        h = self.encoder(h)            # (B, T, d_model)
 
-        z = h.mean(dim=1)             # (B, d_model)
-        z = self.latent_proj(z)       # (B, latent_dim)
+        # Mean pool
+        z = h.mean(dim=1)
+        z = self.latent_norm(z)
 
-        B, T, _ = x.shape
-        z_expanded = z.unsqueeze(1).expand(B, T, self.latent_dim)
-        recon = self.decoder(z_expanded)  # (B, T, D)
+        x_recon = self.output_projection(h)
+        return x_recon, z
 
-        return recon, z
+
+# Alias to avoid import confusion
+TimeSeriesTransformer = TimeSeriesTransformerAE
